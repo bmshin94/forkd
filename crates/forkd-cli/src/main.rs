@@ -4624,10 +4624,13 @@ mod tests {
         let deep = tmp.path().join("a/b/c");
         let bytes = crate::doctor::available_bytes(&deep).expect("statvfs via an ancestor");
         assert!(bytes > 0, "a real filesystem must report free bytes");
-        assert_eq!(
-            bytes,
-            crate::doctor::available_bytes(tmp.path()).expect("statvfs"),
-            "a missing descendant must resolve to the same filesystem as its ancestor"
+        // Not assert_eq: parallel tests write to the same filesystem between
+        // the two probes, so allow drift rather than flake.
+        let ancestor = crate::doctor::available_bytes(tmp.path()).expect("statvfs");
+        assert!(
+            bytes.abs_diff(ancestor) < 1024 * 1024 * 1024,
+            "a missing descendant must resolve to the same filesystem as its ancestor \
+             ({bytes} vs {ancestor})"
         );
     }
 
