@@ -41,6 +41,52 @@ snapshot is fully published, so a tag always holds a consistent
 src == dst guard comment duplication and makes the chain-unpack tail
 bail instead of resolving an empty path.
 
+A later `snapshot` run on that tag now sweeps every
+`<tag>.rootfs.ext4.prev-*` file instead of only the one named for its own
+pid. The backup name is pid-scoped, so a `kill -9` landing between the
+preserve-rename and the publish stranded the file under a pid no
+subsequent run would look for, while the tag was left with no
+`rootfs.ext4` — or with an unpublished, dirtied clone at that path — under
+the old metadata. Unless the tag was republished after the backup was
+parked (`snapshot.json` newer than the park), the newest backup is now
+renamed back into place; the rest are discarded, except a backup whose
+pid is still running a bake.
+
+### Bakes refuse to start on a nearly full disk, and clean up after themselves
+
+Running out of space mid-write does not fail cleanly — it leaves a
+*corrupt* artifact: a rootfs whose package files contain other files'
+bytes, or a truncated `memory.bin`. Inside a guest that surfaces much
+later as `uname: option requires an argument`, `Exec format error`, or
+`EBADMSG` on a `/var/lib/dpkg` entry, which reads like a broken build
+rather than a broken image. `forkd parent build` (conversion) and
+`forkd snapshot` now check free space on the target filesystem first and
+refuse with an explicit error below a 5 GiB reserve
+(`FORKD_MIN_FREE_GIB` to override). The check is advisory: if `statvfs`
+cannot run, it warns and continues rather than blocking work on a broken
+measurement.
+
+`forkd snapshot` also removes its staging dir on every exit now, not only
+on success. A failure after the volatile artifacts were written — boot
+timeout, snapshot error, publish error, interrupt — used to leave a fully
+written `memory.bin` (GBs) beside the snapshot dir that nothing ever
+collected.
+
+### A failed boot no longer orphans its Firecracker process
+
+`Vm::boot` spawned Firecracker and then issued the `/boot-source`,
+`/drives/rootfs`, `/entropy` and `/actions` calls with a bare
+`std::process::Child` in hand. `Child` has no kill-on-drop, so any `?` in
+that window — including `wait_for_sock` timing out — returned an error and
+abandoned a *live* Firecracker. The orphan holds the sandbox's tap device
+and rootfs fd, and the tap name is frozen into the vmstate, so every later
+spawn of that snapshot dies inside Firecracker with `Open tap device
+failed` before it can create its API socket; callers see
+`socket .../child-N.sock never appeared` and the snapshot stays unusable
+until the orphan is killed by hand. The child is now owned by a
+`PendingFirecracker` guard that reaps it on every early return and hands
+it over to the `Vm` only on success.
+
 ### Rootfs sidecar placement: recorded absolute path, validated
 
 Packs record the rootfs sidecar's target as the vmstate-frozen ABSOLUTE
