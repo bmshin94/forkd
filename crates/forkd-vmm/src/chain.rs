@@ -275,9 +275,6 @@ fn copy_base_memory(src: &Path, dst: &Path) -> Result<u64> {
     // EINVAL/EXDEV/EOPNOTSUPP signal "this FS doesn't support
     // reflink for this pair," in which case we fall back. ENOTSUP
     // sometimes appears too.
-    // ioctl number: _IO(0x94, 9). 0x94 is the BTRFS_IOCTL_MAGIC also
-    // used by ficlone (overlayfs, btrfs, xfs, ext4-reflink).
-    const FICLONE: libc::c_ulong = 0x4020_9409;
     // SAFETY: both fds are valid open file descriptors; FICLONE
     // takes the source fd as its argument.
     let rc = unsafe { libc::ioctl(dst_f.as_raw_fd(), FICLONE, src_f.as_raw_fd()) };
@@ -341,8 +338,27 @@ fn fallback_stream_copy(
     Ok(n)
 }
 
+/// `FICLONE` is `_IOW(0x94, 9, int)` = `0x4004_9409`. The kernel matches
+/// the whole number, size field included, so any other value — the old
+/// `0x4020_9409` encoded a 32-byte payload — is answered with ENOTTY,
+/// which the fallback below reads as "no reflink here" and silently
+/// streams a full copy even on btrfs/XFS/ZFS.
+#[cfg(target_os = "linux")]
+const FICLONE: libc::c_ulong = 0x4004_9409;
+
 #[cfg(test)]
 mod tests {
+    /// `_IOW(type, nr, size)` = write dir (1 << 30) | size << 16 | type << 8 | nr.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ficlone_is_iow_0x94_9_int() {
+        let iow = (1u64 << 30)
+            | ((std::mem::size_of::<libc::c_int>() as u64) << 16)
+            | (0x94 << 8)
+            | 9;
+        assert_eq!(super::FICLONE as u64, iow);
+    }
+
     use super::*;
     use crate::VolumeSpec;
     use std::collections::HashMap;

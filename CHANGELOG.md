@@ -6,6 +6,14 @@ Versioning](https://semver.org/spec/v2.0.0.html) once it reaches
 
 ## Unreleased
 
+### Reflink copies actually reflink
+
+`chain::reflink_copy` passed `0x40209409` as `FICLONE`; the real number is
+`_IOW(0x94, 9, int)` = `0x40049409`. The kernel answered the wrong value with
+`ENOTTY`, which the helper treats as "filesystem has no reflink", so every
+chain-assembly base copy and the bake's rootfs baseline clone streamed a full
+copy even on btrfs, XFS, and ZFS 2.2+. Found by @jrimmer in #321.
+
 ### Upgrade note: legacy sandbox rows block startup
 
 The controller now persists a boot identity (start time + boot id) for every
