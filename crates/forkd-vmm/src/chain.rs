@@ -352,10 +352,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn ficlone_is_iow_0x94_9_int() {
-        let iow = (1u64 << 30)
-            | ((std::mem::size_of::<libc::c_int>() as u64) << 16)
-            | (0x94 << 8)
-            | 9;
+        let iow =
+            (1u64 << 30) | ((std::mem::size_of::<libc::c_int>() as u64) << 16) | (0x94 << 8) | 9;
         assert_eq!(super::FICLONE as u64, iow);
     }
 
