@@ -3263,7 +3263,8 @@ fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Resu
     // (park ctime, name, path), newest first. A backup whose metadata
     // cannot be read sorts last rather than being skipped — it is still
     // dropped.
-    let mut backups: Vec<(Option<(i64, i64)>, String, std::path::PathBuf)> = entries
+    type Backup = (Option<(i64, i64)>, String, std::path::PathBuf);
+    let mut backups: Vec<Backup> = entries
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
