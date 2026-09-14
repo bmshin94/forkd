@@ -38,8 +38,11 @@ A later `snapshot` run on that tag now sweeps every
 pid. The backup name is pid-scoped, so a `kill -9` landing between the
 preserve-rename and the publish stranded the file under a pid no
 subsequent run would look for, while the tag was left with no
-`rootfs.ext4` at all. If the published rootfs is missing, the newest
-backup is now renamed back into place; the rest are discarded.
+`rootfs.ext4` — or with an unpublished, dirtied clone at that path — under
+the old metadata. Unless the tag was republished after the backup was
+parked (`snapshot.json` newer than the park), the newest backup is now
+renamed back into place; the rest are discarded, except a backup whose
+pid is still running a bake.
 
 ### Rootfs sidecar placement: recorded absolute path, validated
 

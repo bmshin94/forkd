@@ -3155,22 +3155,32 @@ fn cleanup_workdir(work_dir: &std::path::Path) {
 /// file, and because the crash landed after the rename the tag has no
 /// `rootfs.ext4` at all until someone moves the backup back by hand.
 ///
-/// Sweeping by prefix closes that window:
+/// Sweeping by prefix closes that window. Whether the published
+/// `rootfs.ext4` exists says nothing about whether it is good: the
+/// interrupted run cloned its fresh rootfs to that path right after
+/// parking the backup, and then booted and wrote to it for the whole
+/// warmup — the widest part of the crash window. What decides it is
+/// whether that run *published*:
 ///
-/// - when the published `rootfs.ext4` is missing, the newest backup is
-///   the tag's last good rootfs, so it is renamed back into place — a
-///   later failed bake then preserves it again through the normal path;
-/// - every remaining backup is scratch from a run that never published
-///   (or a superseded one) and is dropped best-effort, so these files
-///   cannot accumulate.
+/// - `snapshot.json` is the publish commit marker, and a run writes it
+///   after it parks the backup. `rename(2)` stamps the backup's ctime,
+///   so a `snapshot.json` whose mtime is not newer than the newest
+///   backup's ctime was never republished: the published metadata is
+///   still frozen against the backup, so the backup is renamed back
+///   over whatever sits at the published path (a partial or dirtied
+///   clone, or nothing);
+/// - otherwise the run published and died before deleting its backup,
+///   and the backup is superseded scratch.
 ///
-/// Ordering is by mtime: `rename(2)` preserves it, so a backup carries
-/// the timestamp of the bake that produced its rootfs, which is the
-/// ordering that matters here. The filename breaks ties so the choice
-/// never depends on readdir order.
+/// Every other backup is dropped best-effort, so these files cannot
+/// accumulate. A backup whose pid is still alive belongs to a concurrent
+/// bake of this tag and is left alone. Ordering is by ctime (park time);
+/// the filename breaks ties so the choice never depends on readdir order.
 fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let live = snap_dir.join("rootfs.ext4");
     let prefix = format!("{tag}.rootfs.ext4.prev-");
+    let own_pid = std::process::id();
     let dir = snap_dir
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -3182,17 +3192,25 @@ fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Resu
             return Err(e).with_context(|| format!("scan {} for rootfs backups", dir.display()))
         }
     };
-    // (mtime, name, path), newest first. A backup whose mtime cannot be
-    // read sorts last rather than being skipped — it is still dropped.
-    let mut backups: Vec<(Option<std::time::SystemTime>, String, std::path::PathBuf)> = entries
+    // (park ctime, name, path), newest first. A backup whose metadata
+    // cannot be read sorts last rather than being skipped — it is still
+    // dropped.
+    let mut backups: Vec<(Option<(i64, i64)>, String, std::path::PathBuf)> = entries
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&prefix) {
-                return None;
+            let pid = name.strip_prefix(&prefix)?;
+            if let Ok(pid) = pid.parse::<u32>() {
+                if pid != own_pid && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    eprintln!(
+                        "    note: leaving rootfs backup {} — pid {pid} is still running",
+                        entry.path().display()
+                    );
+                    return None;
+                }
             }
-            let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
-            Some((mtime, name, entry.path()))
+            let ctime = entry.metadata().ok().map(|m| (m.ctime(), m.ctime_nsec()));
+            Some((ctime, name, entry.path()))
         })
         .collect();
     if backups.is_empty() {
@@ -3200,7 +3218,25 @@ fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Resu
     }
     backups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
-    if !live.exists() {
+    let published_after_park = match (
+        backups[0].0,
+        std::fs::metadata(snap_dir.join("snapshot.json")),
+    ) {
+        (Some(parked), Ok(meta)) => (meta.mtime(), meta.mtime_nsec()) > parked,
+        // No commit marker: nothing was published after the park.
+        (Some(_), Err(_)) => false,
+        // Cannot date the backup: restore it only into an empty slot, and
+        // never delete anything on a guess.
+        (None, _) if live.exists() => {
+            eprintln!(
+                "    warning: cannot read rootfs backups beside {}; leaving them untouched",
+                snap_dir.display()
+            );
+            return Ok(());
+        }
+        (None, _) => false,
+    };
+    if !published_after_park {
         let (_, _, newest) = backups.remove(0);
         std::fs::rename(&newest, &live).with_context(|| {
             format!(
@@ -3213,6 +3249,17 @@ fn recover_or_discard_prev_rootfs(snap_dir: &std::path::Path, tag: &str) -> Resu
             "    recovered tag {tag} rootfs from interrupted re-bake backup {}",
             newest.display()
         );
+    } else if !live.exists() {
+        // Published after the park yet no rootfs: the backup does not
+        // match the published metadata either, so do not guess — keep
+        // every backup for the operator.
+        eprintln!(
+            "    warning: tag {tag} has no rootfs.ext4 but was published after its \
+             rootfs backups were parked; leaving {} backup(s) beside {} untouched",
+            backups.len(),
+            snap_dir.display()
+        );
+        return Ok(());
     }
     for (_, _, stale) in backups {
         match std::fs::remove_file(&stale) {
@@ -4656,6 +4703,8 @@ mod tests {
         let older = tmp.path().join("tag.rootfs.ext4.prev-1000");
         let newer = tmp.path().join("tag.rootfs.ext4.prev-2000");
         write_with_mtime(&older, b"OLD-ROOTFS", 1_700_000_000);
+        // Ordering is by park time (ctime), so park the newer one later.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         write_with_mtime(&newer, b"NEW-ROOTFS", 1_700_000_900);
 
         recover_or_discard_prev_rootfs(&snap_dir, "tag").unwrap();
@@ -4672,11 +4721,12 @@ mod tests {
         );
     }
 
-    /// The settled case: the tag still has its rootfs, so the backups are
-    /// scratch from runs that never published — dropped, and the live
-    /// rootfs is left exactly as it was.
+    /// The settled case: the run published (its `snapshot.json` is newer
+    /// than the park) and died before deleting its backup, so the backups
+    /// are superseded scratch — dropped, and the live rootfs is left
+    /// exactly as it was.
     #[test]
-    fn prev_rootfs_sweep_discards_backups_when_published_rootfs_present() {
+    fn prev_rootfs_sweep_discards_backups_when_published_after_park() {
         let tmp = tempfile::tempdir().unwrap();
         let snap_dir = tmp.path().join("tag");
         std::fs::create_dir_all(&snap_dir).unwrap();
@@ -4686,6 +4736,11 @@ mod tests {
         let b = tmp.path().join("tag.rootfs.ext4.prev-2000");
         write_with_mtime(&a, b"STALE-A", 1_700_000_000);
         write_with_mtime(&b, b"STALE-B", 1_700_000_900);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_with_mtime(&snap_dir.join("snapshot.json"), b"{}", now + 60);
 
         recover_or_discard_prev_rootfs(&snap_dir, "tag").unwrap();
 
@@ -4697,6 +4752,59 @@ mod tests {
         assert!(
             !a.exists() && !b.exists(),
             "stranded backups must not accumulate across runs"
+        );
+    }
+
+    /// The widest crash window: the run parked the backup, cloned a fresh
+    /// rootfs to the published path, and died during boot/warmup. The
+    /// published metadata is still the old bake's, frozen against the
+    /// backup, so the backup must replace the dirtied clone — not be
+    /// discarded because a `rootfs.ext4` happens to exist.
+    #[test]
+    fn prev_rootfs_sweep_restores_backup_over_unpublished_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_dir = tmp.path().join("tag");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        write_with_mtime(&snap_dir.join("snapshot.json"), b"{}", 1_700_000_000);
+        let backup = tmp.path().join("tag.rootfs.ext4.prev-1000");
+        write_with_mtime(&backup, b"LAST-PUBLISHED", 1_700_000_000);
+        std::fs::write(snap_dir.join("rootfs.ext4"), b"UNPUBLISHED-DIRTY-CLONE").unwrap();
+
+        recover_or_discard_prev_rootfs(&snap_dir, "tag").unwrap();
+
+        assert_eq!(
+            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
+            b"LAST-PUBLISHED",
+            "the published metadata's rootfs must be put back over the clone"
+        );
+        assert!(!backup.exists());
+    }
+
+    /// A backup named for a live pid belongs to a concurrent bake of the
+    /// same tag, whose rollback still needs it.
+    #[test]
+    fn prev_rootfs_sweep_leaves_a_running_bakes_backup_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_dir = tmp.path().join("tag");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(snap_dir.join("rootfs.ext4"), b"IN-PROGRESS").unwrap();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let backup = tmp
+            .path()
+            .join(format!("tag.rootfs.ext4.prev-{}", other.id()));
+        std::fs::write(&backup, b"THEIRS").unwrap();
+
+        recover_or_discard_prev_rootfs(&snap_dir, "tag").unwrap();
+        let _ = other.kill();
+        let _ = other.wait();
+
+        assert!(backup.exists(), "a running bake's backup must survive");
+        assert_eq!(
+            std::fs::read(snap_dir.join("rootfs.ext4")).unwrap(),
+            b"IN-PROGRESS"
         );
     }
 
